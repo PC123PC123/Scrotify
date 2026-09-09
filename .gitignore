@@ -1,0 +1,29 @@
+# Dart/Pub related
+**/pubspec.lock
+**/.pkgconfig
+**/*.dill
+**/*.gen.dart
+*.log
+pubspec.lock
+
+# Flutter related
+**/android
+**/ios
+**/web
+**/macos
+**/linux
+**/windows
+**/.idea
+**/.vscode
+**/.gradle
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/.pub-cache
+**/.pub
+
+# Other
+.DS_Store
+*.swp
+*.swo
+*~

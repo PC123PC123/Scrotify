@@ -1,0 +1,1 @@
+# Scrotify - Navidrome Client

@@ -1,0 +1,1 @@
+ /home/pc/Proyectos/Scrotify/scrotify/.dart_tool/flutter_build/dd3b0ce9387e4dc57dc732648eb79237/native_assets.yaml: 
