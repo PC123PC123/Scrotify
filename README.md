@@ -1,1 +1,1 @@
-# Scrotify - Navidrome Client
+# Scrotify - Navidrome Client (vibe coding)
