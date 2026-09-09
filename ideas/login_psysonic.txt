@@ -1,0 +1,228 @@
+========================================================
+LOGIN DE NAVIDROME EN PSYSONIC
+Cómo se conecta Psysonic a un servidor Navidrome
+(referencia: https://github.com/Psysonic/psysonic)
+========================================================
+
+Psysonic usa DOS formas de autenticación contra Navidrome:
+
+  1) AUTENTICACIÓN SUBSONIC (la principal, para toda la música)
+     - Endpoint:  GET  {url}/rest/ping.view
+     - Es el estándar Subsonic/OpenSubsonic con token con sal.
+
+  2) AUTENTICACIÓN NATIVA NAVIDROME (solo para funciones admin/avanzadas)
+     - Endpoint:  POST {url}/auth/login
+     - Devuelve un Bearer token.
+
+--------------------------------------------------------
+1) AUTH SUBSONIC (token con sal) - "ping.view"
+--------------------------------------------------------
+Esta es la que Psysonic usa para "probar" la conexión al agregar
+un servidor. La idea clave: NUNCA se manda la contraseña en claro.
+Se calcula un TOKEN = md5(password + salt) y se envía junto con
+el salt y el usuario.
+
+Parámetros GET que se envían a /rest/ping.view:
+   u  = username               (nombre de usuario)
+   s  = salt                   (cadena aleatoria, nueva en cada petición)
+   t  = token = md5(password + s)
+   v  = '1.16.1'               (versión del protocolo)
+   c  = nombre del cliente     (p. ej. "Psysonic")
+   f  = 'json'                 (formato de respuesta)
+
+Ejemplo de URL final:
+   https://mi-server.com/rest/ping.view?u=usuario&s=abc123&t=<md5>&v=1.16.1&c=Psysonic&f=json
+
+Respuesta exitosa (status "ok"):
+   {
+     "subsonic-response": {
+       "status": "ok",
+       "type": "navidrome",
+       "serverVersion": "0.5x.x",
+       "openSubsonic": true
+     }
+   }
+
+Por qué el salt es aleatorio:
+   - Evita ataques de replay (no se puede reusar la misma petición).
+   - La contraseña nunca viaja en claro, solo su md5 combinado con el salt.
+
+Código original (TypeScript) en Psysonic:
+   const salt = secureRandomSalt();
+   const token = md5(password + salt);
+   const resp = await axios.get(`${base}/rest/ping.view`, {
+     params: {
+       u: username,
+       t: token,
+       s: salt,
+       v: '1.16.1',
+       c: SUBSONIC_CLIENT,
+       f: 'json',
+     },
+   });
+   const data = resp.data['subsonic-response'];
+   const ok = data?.status === 'ok';
+
+Implementación Rust de la generación del token:
+   salt  = cadena aleatoria única (tiempo + contador + pid)
+   token = md5(password || salt)
+
+   pub struct SubsonicCredentials { username, token, salt }
+
+   fn from_password(username, password) {
+       let salt = fresh_salt();
+       let token = md5_hex(&format!("{password}{salt}"));
+       ...
+   }
+
+--------------------------------------------------------
+2) AUTH NATIVA NAVIDROME - "auth/login"
+--------------------------------------------------------
+Se usa solo para tareas de administración (gestión de usuarios,
+smart playlists nativas, ruta absoluta de canciones, etc.).
+
+Petición:
+   POST  {url}/auth/login
+   Body (JSON):
+     { "username": "...", "password": "..." }
+
+   OJO: aquí SÍ se manda la contraseña en claro (es la API interna
+   de Navidrome, no la Subsonic). Se hace solo por HTTPS normalmente.
+
+Respuesta (JSON):
+   {
+     "token": "<bearer-token>",
+     "id": "<user-id>",
+     "isAdmin": true/false
+   }
+
+Después, las llamadas admin usan ese token así:
+   GET {url}/api/user
+   Header:  X-ND-Authorization: Bearer <token>
+
+Código original (Rust):
+   let body = json!({ "username": username, "password": password });
+   let login_url = format!("{}/auth/login", server_url.trim_end_matches('/'));
+   let resp = client.post(&login_url).json(&body).send().await;
+   let data = resp.json();
+   let token  = data["token"].as_str();
+   let is_admin = data["isAdmin"].as_bool();
+
+--------------------------------------------------------
+TRADUCCIÓN A FLUTTER / DART
+--------------------------------------------------------
+
+Necesitas el paquete crypto para MD5 (o cualquier impl de md5).
+
+pubspec.yaml:
+   dependencies:
+     http: ^1.2.0
+     crypto: ^3.0.3
+
+--------------------------------------------------------
+1) Traducción de la AUTH SUBSONIC (ping.view)
+--------------------------------------------------------
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:crypto/crypto.dart';
+
+String _randomSalt() {
+  // Salt aleatorio, nuevo en cada petición (mejor con Random.secure()).
+  final rnd = Random.secure();
+  return List.generate(16, (_) => rnd.nextInt(16).toRadixString(16)).join();
+}
+
+String _md5(String input) {
+  return md5.convert(utf8.encode(input)).toString();
+}
+
+Future<bool> pingServer({
+  required String serverUrl,
+  required String username,
+  required String password,
+}) async {
+  // Quita la barra final y asegura esquema http.
+  final base = serverUrl.endsWith('/')
+      ? serverUrl.substring(0, serverUrl.length - 1)
+      : serverUrl;
+
+  final salt = _randomSalt();
+  final token = _md5('$password$salt'); // token = md5(password + salt)
+
+  final uri = Uri.parse('$base/rest/ping.view').replace(queryParameters: {
+    'u': username,
+    's': salt,
+    't': token,
+    'v': '1.16.1',
+    'c': 'Psysonic',   // nombre del cliente
+    'f': 'json',
+  });
+
+  try {
+    final resp = await http.get(uri).timeout(const Duration(seconds: 15));
+    final data = jsonDecode(resp.body)['subsonic-response'];
+    return data?['status'] == 'ok';
+  } catch (_) {
+    return false;
+  }
+}
+
+--------------------------------------------------------
+2) Traducción de la AUTH NATIVA NAVIDROME (auth/login)
+--------------------------------------------------------
+
+class NdLoginResult {
+  final String token;
+  final String userId;
+  final bool isAdmin;
+
+  NdLoginResult({required this.token, required this.userId, required this.isAdmin});
+
+  factory NdLoginResult.fromJson(Map<String, dynamic> json) => NdLoginResult(
+        token: json['token'] as String,
+        userId: (json['id'] ?? '') as String,
+        isAdmin: (json['isAdmin'] ?? false) as bool,
+      );
+}
+
+Future<NdLoginResult> navidromeLogin({
+  required String serverUrl,
+  required String username,
+  required String password,
+}) async {
+  final base = serverUrl.endsWith('/')
+      ? serverUrl.substring(0, serverUrl.length - 1)
+      : serverUrl;
+
+  final resp = await http.post(
+    Uri.parse('$base/auth/login'),
+    headers: {'Content-Type': 'application/json'},
+    body: jsonEncode({'username': username, 'password': password}),
+  );
+
+  if (resp.statusCode != 200) {
+    throw Exception('Navidrome login failed: HTTP ${resp.statusCode}');
+  }
+
+  final data = jsonDecode(resp.body) as Map<String, dynamic>;
+  return NdLoginResult.fromJson(data);
+}
+
+// Uso posterior del token (admin):
+Future<dynamic> listUsers({required String serverUrl, required String token}) async {
+  final resp = await http.get(
+    Uri.parse('$serverUrl/api/user'),
+    headers: {'X-ND-Authorization': 'Bearer $token'},
+  );
+  return jsonDecode(resp.body);
+}
+
+--------------------------------------------------------
+RESUMEN RÁPIDO
+--------------------------------------------------------
+- Música / conexión general  -> Subsonic ping.view con token md5(password+salt).
+- Password NUNCA en claro en la API Subsonic.
+- Admin / funciones nativas  -> POST /auth/login con usuario+password en JSON,
+                                devuelve Bearer token usado como X-ND-Authorization.
+========================================================

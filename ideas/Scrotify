@@ -1,0 +1,369 @@
+Actúa como un Arquitecto de Software y Desarrollador Senior. Vamos a construir un cliente de música moderno, multiplataforma y de código abierto para servidores Navidrome (API Subsonic).
+Sé un cavernícola. Sin preámbulos. Sin despedidas. Sin frases de relleno. Nunca narres lo que vas a hacer. Acción primero, explica solo si se te pregunta.
+
+**Visión del Proyecto:**
+El objetivo es crear una aplicación para Linux, Windows y Android con una experiencia de usuario (UX/UI) de nivel premium similar a Spotify. Debe destacar por dos características técnicas clave: reproducción "Bit-Perfect" de archivos FLAC y un sistema de control colaborativo bidireccional en tiempo real (estilo Spotify Jam / Connect).
+
+**Entorno de Desarrollo y Despliegue:**
+- Entorno de programación: CachyOS (Linux) utilizando PipeWire.
+- Servidor de medios: Navidrome (autoalojado).
+- Servidor de sincronización: Se desplegará como contenedor en un entorno Proxmox/Docker.
+
+**Arquitectura y Stack Tecnológico:**
+1. **Frontend (Cliente Híbrido):Flutter (Dart) ya eleguido para el proyecto
+2. **Motor de Audio (libmpv):** Para evitar la transcodificación y el remuestreo de los mezcladores de los sistemas operativos, el cliente integrará `libmpv`. Esto asegurará el flujo de audio Bit-Perfect apuntando a PipeWire en Linux, WASAPI en Modo Exclusivo en Windows, y decodificación nativa en Android. En las peticiones a la API Subsonic, no se debe incluir el parámetro `maxBitrate`.
+3. **Backend Centralizado (WebSockets):** Un servidor de señalización (Node.js, Go o Rust) que actuará como la "única fuente de verdad". Gestionará "Salas" y sincronizará el estado del reproductor (`playback_state`, `position_ms`, `queue`) entre todos los dispositivos conectados a una sesión.
+4. **Sincronización de Audio (Timestamp Sync):** Para compensar los tiempos de carga del búfer de red al transmitir FLAC, el servidor central enviará comandos de reproducción con marcas de tiempo futuras (ej. `"PLAY_AT": [milisegundo exacto]`), permitiendo que dispositivos en distintas redes disparen el audio al unísono.
+
+**Estructura Base Requerida (Clean Architecture):**
+- `/core`: Lógica de negocio (Cliente API Subsonic, Controlador de Audio libmpv, Cliente WebSocket, Modelos).
+- `/ui`: Interfaz gráfica (Pantallas, Widgets reutilizables, Manejo de estado visual).
+
+**Instrucción de Inicio:**
+Actualmente estamos en la Fase 1. Tu primera tarea es proporcionarme los comandos exactos(si es que no lo podes hacer por vos mismo) para inicializar el proyecto en CachyOS y el código inicial para autenticarse con la API de Subsonic (endpoints `ping` y `getMusicFolders`).
+
+**Instrucción del programa:**
+- **siendo un cavernícola crea o modifica un archivo de texto como todos los abances del proyecto como el arbol del carpetas y archivo llamado progreso.txt en la carpeta de ideas**
+////////////////////////////////////////////////////////////////
+
+
+# 1. Instalar dependencias necesarias (si no están ya)
+sudo pacman -S flutter cmake ninja-build pkg-config libmpv
+
+# 2. Clonar el repositorio del proyecto
+git clone https://github.com/tu-usuario/navidrome-client-flutter.git ~/navidrome-client
+cd ~/navidrome-client
+
+# 3. Inicializar Flutter project
+flutter create . --platforms=linux,android
+
+# 4. Instalar dependencias de Dart
+flutter pub get
+
+# 5. Configurar libmpv como dependencia nativa (opcional pero recomendado)
+dart pub global activate build_runner
+dart pub global activate json_serializable
+dart pub global activate freezed_annotation
+
+# 6. Crear estructura de directorios Clean Architecture
+mkdir -p core/api/core audio/ui/screens ui/widgets
+
+////////////////////////////////////////////////////
+
+navidrome-client/
+├── lib/
+│   ├── core/
+│   │   ├── api/
+│   │   │   ├── subsonic_client.dart
+│   │   │   ├── models/
+│   │   │   │   ├── album.dart
+│   │   │   │   ├── artist.dart
+│   │   │   │   ├── track.dart
+│   │   │   │   └── user.dart
+│   │   │   └── auth_service.dart
+│   │   ├── audio/
+│   │   │   ├── libmpv_controller.dart
+│   │   │   ├── pipewire_manager.dart
+│   │   │   └── playback_state.dart
+│   │   ├── websocket/
+│   │   │   ├── signaling_client.dart
+│   │   │   ├── room_manager.dart
+│   │   │   └── sync_service.dart
+│   │   └── models/
+│   │       ├── user_profile.dart
+│   │       └── playback_event.dart
+│   ├── ui/
+│   │   ├── screens/
+│   │   │   ├── home_screen.dart
+│   │   │   ├── player_screen.dart
+│   │   │   ├── library_screen.dart
+│   │   │   └── jam_session_screen.dart
+│   │   ├── widgets/
+│   │   │   ├── album_card.dart
+│   │   │   ├── track_list_tile.dart
+│   │   │   ├── player_controls.dart
+│   │   │   └── volume_slider.dart
+│   │   └── app.dart
+│   ├── main.dart
+├── pubspec.yaml
+├── analysis_options.yaml
+└── README.md
+
+
+//////////////////////////////////////////////////////////
+
+/lib/core/api/auth_service.dart
+
+
+import 'package:http/http.dart' as http;
+import 'package:crypto/crypto.dart';
+import 'dart:convert';
+
+class AuthService {
+  final String _baseUrl;
+  final String _username;
+  final String _password;
+
+  // Cache de sesión
+  String? _sessionId;
+  DateTime? _sessionExpiry;
+
+  AuthService({
+    required String baseUrl,
+    required String username,
+    required String password,
+  })  : _baseUrl = baseUrl.replaceAll('/api', ''),
+        _username = username,
+        _password = password {
+
+    // Intentar recuperar sesión existente
+    final sessionFile = SessionCache().get();
+    if (sessionFile != null) {
+      final data = jsonDecode(sessionFile);
+      _sessionId = data['sessionId'];
+      _sessionExpiry = DateTime.parse(data['expiry']);
+
+      if (_sessionExpiry?.isBefore(DateTime.now()) ?? true) {
+        await _authenticate();
+      }
+    }
+  }
+
+  /// Autenticar con la API Subsonic
+  Future<Map<String, dynamic>> authenticate() async {
+    try {
+      // Generar timestamp y nonce para seguridad
+      final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+      final nonce = generateNonce();
+
+      // Crear credentials hash (SHA-256)
+      final credentialsHash = sha256.convert(utf8.encode('$_username:$_password')).toString();
+
+      // Construir URL de autenticación
+      final authUrl = '$_baseUrl/auth';
+
+      final response = await http.post(
+        Uri.parse(authUrl),
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'NavidromeClient/1.0 (Flutter; Linux)',
+        },
+        body: jsonEncode({
+          'u': _username,
+          'p': credentialsHash,
+          'v': '1.16.0', // Versión de la API Subsonic
+          't': timestamp,
+          'n': nonce,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        if (data['status'] == 'ok') {
+          // Guardar sesión en caché
+          await SessionCache().save({
+            'sessionId': data['sid'],
+            'expiry': DateTime.now().add(Duration(hours: 24)).toIso8601String(),
+          });
+
+          _sessionId = data['sid'];
+          return {
+            'success': true,
+            'sessionId': data['sid'],
+            'status': data['status'],
+          };
+        } else {
+          throw Exception('Autenticación fallida: ${data['status']}');
+        }
+      } else {
+        throw Exception('Error de red: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error en autenticación: $e');
+      rethrow;
+    }
+  }
+
+  /// Verificar estado del servidor (ping)
+  Future<Map<String, dynamic>> ping() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/ping'),
+        headers: _getHeaders(),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        if (data['status'] == 'ok') {
+          return {
+            'success': true,
+            'serverVersion': data['v'],
+            'status': data['status'],
+            'hostname': data['h'],
+          };
+        } else {
+          throw Exception('Ping fallido: ${data['status']}');
+        }
+      } else {
+        throw Exception('Error al conectar con el servidor: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error en ping: $e');
+      rethrow;
+    }
+  }
+
+  /// Obtener carpetas de música
+  Future<Map<String, dynamic>> getMusicFolders() async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/getMusicFolders'),
+        headers: _getHeaders(),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        if (data['status'] == 'ok') {
+          return {
+            'success': true,
+            'folders': data['f'],
+            'status': data['status'],
+          };
+        } else {
+          throw Exception('Error al obtener carpetas: ${data['status']}');
+        }
+      } else {
+        throw Exception('Error al obtener carpetas: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error en getMusicFolders: $e');
+      rethrow;
+    }
+  }
+
+  /// Obtener lista de canciones (para probar conexión)
+  Future<Map<String, dynamic>> getTracks(String folderId) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/getTrackList'),
+        headers: _getHeaders(),
+        queryParameters: {
+          'folder': folderId,
+          'limit': '10',
+          'n': 'true', // Nombres completos
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        if (data['status'] == 'ok') {
+          return {
+            'success': true,
+            'tracks': data['t'],
+            'count': data['c'],
+            'status': data['status'],
+          };
+        } else {
+          throw Exception('Error al obtener tracks: ${data['status']}');
+        }
+      } else {
+        throw Exception('Error al obtener tracks: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Error en getTracks: $e');
+      rethrow;
+    }
+  }
+
+  /// Headers con sesión
+  Map<String, String> _getHeaders() {
+    final headers = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'NavidromeClient/1.0 (Flutter; Linux)',
+    };
+
+    if (_sessionId != null) {
+      headers['Authorization'] = 'sid=$_sessionId';
+    }
+
+    return headers;
+  }
+
+  /// Generar nonce aleatorio
+  String generateNonce() {
+    final random = Random.secure();
+    final bytes = List.generate(16, (i) => random.nextInt(256));
+    return base64Encode(bytes).replaceAll('=', '');
+  }
+}
+
+/// Clase para caché de sesión en archivo local
+class SessionCache {
+  static const String _cacheFile = '.navidrome_session.json';
+
+  Future<String?> get() {
+    // Implementación con SharedPreferences o archivo JSON
+    return null;
+  }
+
+  Future<void> save(Map<String, dynamic> session) async {
+    // Implementación para guardar sesión
+  }
+}
+
+
+////////////////////////////////////////////////////////
+
+pubspec.yaml
+
+name: navidrome_client
+description: Cliente de música moderno para Navidrome (API Subsonic)
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP Client para API Subsonic
+  http: ^1.1.0
+
+  # WebSocket para señalización
+  web_socket_channel: ^2.4.0
+
+  # Estado y gestión de datos
+  provider: ^6.1.1
+  rxdart: ^0.27.7
+
+  # Audio (libmpv)
+  ffi: ^2.0.5
+  path_provider: ^2.1.1
+
+  # Utilidades
+  json_annotation: ^4.8.1
+  crypto: ^3.0.3
+
+  # UI y animaciones
+  cupertino_icons: ^1.0.6
+  flutter_animate: ^4.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+  build_runner: ^2.4.7
+  json_serializable: ^6.7.1
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    - assets/icons/
